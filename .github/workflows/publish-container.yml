@@ -1,0 +1,289 @@
+name: Build and publish container image and Helm chart
+
+# Mirrors the split in publish.yml:
+# - Root vMAJOR.MINOR.PATCH tags validate, build, publish and sign.
+# - Manual dispatch builds both artifacts for branch validation and publishes
+#   nothing unless `publish` is explicitly set.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+      - "!v*-*"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "deploy/helm/**"
+      - ".github/workflows/publish-container.yml"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Push the image and chart to GHCR. Off by default; branch builds should validate only."
+        required: true
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/switchyard-server
+  CHART_DIR: deploy/helm/switchyard
+
+permissions:
+  contents: read
+
+# Releases must not be cancelled halfway through publishing; PR validation may be.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    name: Validate versions and chart
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.versions.outputs.version }}
+      chart_version: ${{ steps.versions.outputs.chart_version }}
+      publish: ${{ steps.decide.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The image version is the Rust workspace version, which is what
+      # `switchyard-server --version` reports. On a tag it must match exactly,
+      # so a release can never ship a binary that disagrees with its tag.
+      - name: Resolve and check versions
+        id: versions
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          import re
+          import tomllib
+
+          with open("Cargo.toml", "rb") as file:
+              version = tomllib.load(file)["workspace"]["package"]["version"]
+
+          with open("deploy/helm/switchyard/Chart.yaml") as file:
+              chart = file.read()
+          chart_version = re.search(r"^version:\s*(\S+)", chart, re.M).group(1)
+          app_version = re.search(r'^appVersion:\s*"?([^"\s]+)"?', chart, re.M).group(1)
+
+          if app_version != version:
+              raise SystemExit(
+                  f"Chart appVersion {app_version!r} does not match workspace version {version!r}"
+              )
+
+          tag = os.environ.get("GITHUB_REF_NAME", "")
+          if os.environ.get("GITHUB_REF_TYPE") == "tag":
+              if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+                  raise SystemExit(f"release tags must look like vMAJOR.MINOR.PATCH, got {tag!r}")
+              if tag != f"v{version}":
+                  raise SystemExit(
+                      f"release tag {tag!r} does not match workspace version {version!r}"
+                  )
+
+          print(f"version={version}")
+          print(f"chart_version={chart_version}")
+          PY
+
+      - name: Decide whether to publish
+        id: decide
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ] || [ "${{ inputs.publish }}" = "true" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: Lint chart
+        run: helm lint "${CHART_DIR}" --strict
+
+      # Rendering with each example's values catches template errors that a
+      # bare `helm lint` misses.
+      - name: Render chart against example values
+        run: |
+          for values in examples/kubernetes/*/values.switchyard.yaml; do
+            echo "::group::${values}"
+            helm template switchyard "${CHART_DIR}" -f "${values}" > /dev/null
+            echo "::endgroup::"
+          done
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners per architecture. Emulated arm64 builds of this
+          # workspace take long enough to hit job timeouts.
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare platform slug
+        id: slug
+        run: echo "value=${{ matrix.platform }}" | tr '/' '-' >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: needs.validate.outputs.publish == 'true'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build once by digest per architecture; the merge job assembles the
+      # multi-arch manifest list. Tagging here would race between architectures.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            SWITCHYARD_VERSION=${{ needs.validate.outputs.version }}
+          cache-from: type=gha,scope=${{ steps.slug.outputs.value }}
+          cache-to: type=gha,mode=max,scope=${{ steps.slug.outputs.value }}
+          provenance: false
+          sbom: false
+          outputs: >-
+            ${{ needs.validate.outputs.publish == 'true'
+              && format('type=image,name={0}/{1},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, env.IMAGE_NAME)
+              || 'type=cacheonly' }}
+
+      - name: Export digest
+        if: needs.validate.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          # Filename is the bare digest; the merge job re-attaches the prefix.
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        if: needs.validate.outputs.publish == 'true'
+        with:
+          name: digest-${{ steps.slug.outputs.value }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish multi-arch image
+    needs: [validate, build]
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # Required for keyless signing and build provenance.
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.inspect.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=sha,format=long,enable=${{ github.ref_type != 'tag' }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+
+      - name: Create manifest list
+        working-directory: /tmp/digests
+        run: |
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta.outputs.json }}') \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect published image
+        id: inspect
+        run: |
+          docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${{ needs.validate.outputs.version }}"
+          digest=$(docker buildx imagetools inspect \
+            "${REGISTRY}/${IMAGE_NAME}:${{ needs.validate.outputs.version }}" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      # Lets consumers verify the image was built by this workflow from this
+      # commit, rather than pushed by hand.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.inspect.outputs.digest }}
+          push-to-registry: true
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        run: |
+          cosign sign --yes \
+            "${REGISTRY}/${IMAGE_NAME}@${{ steps.inspect.outputs.digest }}"
+
+  chart:
+    name: Publish Helm chart
+    needs: [validate, merge]
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login "${REGISTRY}" -u "${{ github.actor }}" --password-stdin
+
+      # The chart carries its own version; appVersion is pinned to the image
+      # this run published so the two can never drift.
+      - name: Package chart
+        run: |
+          helm package "${CHART_DIR}" \
+            --version "${{ needs.validate.outputs.chart_version }}" \
+            --app-version "${{ needs.validate.outputs.version }}" \
+            --destination /tmp/charts
+
+      - name: Push chart
+        run: |
+          helm push \
+            "/tmp/charts/switchyard-${{ needs.validate.outputs.chart_version }}.tgz" \
+            "oci://${REGISTRY}/${{ github.repository }}/charts"
