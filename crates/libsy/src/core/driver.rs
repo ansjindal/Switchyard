@@ -47,7 +47,10 @@
 //! producer runs on a task the driver does not own, hard cancellation (e.g. mid-compute
 //! that never touches the driver) is the caller's concern — abort the producer task.
 
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    sync::{Arc, LazyLock},
+};
 
 use crate::{DriverError, LibsyError, Result};
 use parking_lot::Mutex;
@@ -61,8 +64,51 @@ use tokio_stream::wrappers::ReceiverStream;
 type BoxAny = Box<dyn Any + Send>;
 type StepResult = Result<DriverStep>;
 
-// TODO make request timeout configurable
-const FULFILL_REQUEST_TIMEOUT: Duration = Duration::from_mins(10);
+/// Default ceiling on how long a consumer may take to fulfil one request.
+const DEFAULT_FULFILL_REQUEST_TIMEOUT: Duration = Duration::from_mins(10);
+
+/// Environment variable overriding [`DEFAULT_FULFILL_REQUEST_TIMEOUT`], in whole
+/// seconds.
+const FULFILL_REQUEST_TIMEOUT_ENV: &str = "SWITCHYARD_REQUEST_TIMEOUT_SECS";
+
+/// Ceiling on how long a consumer may take to fulfil one request.
+///
+/// Ten minutes is generous for a chat completion but not for a reasoning model
+/// working through a hard problem at a large `max_tokens`, where a single answer
+/// can exceed it and the whole request is then discarded after its tokens have
+/// already been paid for. Reading the override from the environment keeps the
+/// ceiling reachable for an operator without threading a parameter through
+/// every algorithm's `run_stream`.
+///
+/// Read once: the value is process-wide and changing it mid-run would make
+/// timeouts non-reproducible. An unparseable or zero value falls back to the
+/// default rather than failing startup, since a proxy that refuses to serve is
+/// worse than one using a sane ceiling.
+static FULFILL_REQUEST_TIMEOUT: LazyLock<Duration> =
+    LazyLock::new(|| parse_request_timeout(std::env::var(FULFILL_REQUEST_TIMEOUT_ENV).ok()));
+
+/// Resolves the configured timeout from the raw environment value.
+///
+/// Split out from the `LazyLock` so it can be tested directly: the static is
+/// resolved once per process, and mutating the environment from a test would
+/// race with every other test in the binary.
+fn parse_request_timeout(raw: Option<String>) -> Duration {
+    let Some(raw) = raw else {
+        return DEFAULT_FULFILL_REQUEST_TIMEOUT;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => Duration::from_secs(secs),
+        _ => {
+            tracing::warn!(
+                env = FULFILL_REQUEST_TIMEOUT_ENV,
+                value = %raw,
+                default_secs = DEFAULT_FULFILL_REQUEST_TIMEOUT.as_secs(),
+                "ignoring unusable request timeout override; using the default"
+            );
+            DEFAULT_FULFILL_REQUEST_TIMEOUT
+        }
+    }
+}
 
 /// One item on the stream returned by [`TypeErasedDriver::stream`].
 pub enum DriverStep {
@@ -175,10 +221,10 @@ impl TypeErasedDriver {
 
         // Outer error: the promise was dropped without a response. Inner error: the
         // consumer fulfilled it with an explicit `Err` — propagate it as-is.
-        let response = timeout(FULFILL_REQUEST_TIMEOUT, rx)
+        let response = timeout(*FULFILL_REQUEST_TIMEOUT, rx)
             .await
             .map_err(|_| DriverError::ResponseTimedOut {
-                timeout: FULFILL_REQUEST_TIMEOUT,
+                timeout: *FULFILL_REQUEST_TIMEOUT,
             })?
             .map_err(|_| DriverError::ResponseDropped)??;
         response.downcast::<RES>().map(|boxed| *boxed).map_err(|_| {
@@ -269,6 +315,36 @@ mod tests {
 
     fn test_error(message: &'static str) -> LibsyError {
         LibsyError::external("test", TestError(message))
+    }
+
+    #[test]
+    fn request_timeout_override_is_read_in_seconds() {
+        assert_eq!(
+            parse_request_timeout(Some("1800".to_string())),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(
+            parse_request_timeout(Some("  1800  ".to_string())),
+            Duration::from_secs(1800)
+        );
+    }
+
+    #[test]
+    fn request_timeout_falls_back_to_the_default() {
+        // Unset, non-numeric, zero and negative all keep the default rather
+        // than disabling the ceiling or failing startup.
+        for raw in [
+            None,
+            Some(String::new()),
+            Some("soon".into()),
+            Some("0".into()),
+        ] {
+            assert_eq!(parse_request_timeout(raw), DEFAULT_FULFILL_REQUEST_TIMEOUT);
+        }
+        assert_eq!(
+            parse_request_timeout(Some("-5".into())),
+            DEFAULT_FULFILL_REQUEST_TIMEOUT
+        );
     }
 
     #[tokio::test]
